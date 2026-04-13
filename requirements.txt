@@ -1,0 +1,30 @@
+# ────────────────────────────────────────────────────────────────────
+#  Facial Recognition Attendance System – Requirements
+#  CPU-only build (no CUDA / GPU required)
+# ────────────────────────────────────────────────────────────────────
+
+# ── Deep Learning – CPU-only PyTorch ─────────────────────────────────
+# Install from the official CPU wheel index (much smaller download)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+torchvision>=0.15.0
+facenet-pytorch>=2.5.3       # MTCNN + InceptionResnetV1 (FaceNet)
+
+# ── Computer Vision ───────────────────────────────────────────────────
+opencv-python>=4.8.0
+Pillow>=9.5.0
+
+# ── Similarity Search ─────────────────────────────────────────────────
+faiss-cpu>=1.7.4              # CPU-only FAISS
+
+# ── Web Framework ─────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9      # Required for UploadFile in FastAPI
+
+# ── Database ──────────────────────────────────────────────────────────
+sqlalchemy>=2.0.0
+
+# ── Utilities ─────────────────────────────────────────────────────────
+numpy>=2.0.0
+pydantic>=2.0.0
