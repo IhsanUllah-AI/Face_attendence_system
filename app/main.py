@@ -13,12 +13,18 @@ import logging
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 from app.api import attendance, enroll, recognize
 from app.api import dashboard
-from app.config import API_TITLE, API_VERSION, BASE_DIR
+from app.config import (
+    API_TITLE, API_VERSION, BASE_DIR, ALLOWED_ORIGINS, 
+    ALLOWED_METHODS, ALLOWED_HEADERS, ENVIRONMENT, DEBUG,
+    REQUEST_TIMEOUT_SECONDS
+)
 from app.database.db import init_db
 from app.models.schemas import HealthResponse
 
@@ -33,6 +39,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
+# Rate Limiting
+# ─────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
+
+# ─────────────────────────────────────────────
 # App
 # ─────────────────────────────────────────────
 app = FastAPI(
@@ -42,19 +53,31 @@ app = FastAPI(
         "An end-to-end Facial Recognition Attendance System "
         "using MTCNN + FaceNet + FAISS + FastAPI."
     ),
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if DEBUG else None,
+    redoc_url="/redoc" if DEBUG else None,
 )
 
+app.state.limiter = limiter
+
 # ─────────────────────────────────────────────
-# CORS
+# Trusted Host Middleware (prevent DNS rebinding)
+# ─────────────────────────────────────────────
+if ENVIRONMENT == "production":
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["localhost", "127.0.0.1"] if DEBUG else ALLOWED_ORIGINS,
+    )
+
+# ─────────────────────────────────────────────
+# CORS Middleware (improved security)
 # ─────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=ALLOWED_METHODS,
+    allow_headers=ALLOWED_HEADERS,
+    max_age=3600,  # 1 hour
 )
 
 # ─────────────────────────────────────────────
@@ -65,7 +88,13 @@ async def on_startup() -> None:
     """Initialise DB tables on application startup."""
     init_db()
     logger.info("Database initialised.")
-    logger.info("%s v%s is ready.", API_TITLE, API_VERSION)
+    logger.info(
+        "%s v%s is ready (environment: %s)",
+        API_TITLE,
+        API_VERSION,
+        ENVIRONMENT,
+    )
+    logger.info("Request timeout: %d seconds", REQUEST_TIMEOUT_SECONDS)
 
 
 # ─────────────────────────────────────────────
@@ -98,6 +127,8 @@ async def health_check() -> HealthResponse:
     return HealthResponse(
         status="ok",
         version=API_VERSION,
+        message="System is operational.",
+    )
         message="Facial Recognition Attendance System is running.",
     )
 

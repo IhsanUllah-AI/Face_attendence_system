@@ -18,7 +18,7 @@ from PIL import Image as PILImage
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.config import UNKNOWN_LABEL
+from app.config import UNKNOWN_LABEL, MAX_UPLOAD_SIZE_BYTES, REQUEST_TIMEOUT_SECONDS
 from app.core.attendance_manager import AttendanceManager
 from app.core.detector import FaceDetector
 from app.core.embedder import FaceEmbedder
@@ -34,20 +34,12 @@ _detector   = FaceDetector()
 _embedder   = FaceEmbedder()
 _recognizer = FaceRecognizer()
 
-# Try to load a pre-built index at startup
-_index_ready = _recognizer.load()
-if not _index_ready:
+# Load initial index (or log warning if not ready)
+_index_loaded = _recognizer.load()
+if not _index_loaded:
     logger.warning(
-        "No FAISS index found. Call POST /enroll first to build one."
+        "No FAISS index found at startup. Call POST /enroll first to build one."
     )
-
-
-def _reload_recognizer() -> bool:
-    """Reload the FAISS index from disk (picks up any freshly-enrolled data)."""
-    loaded = _recognizer.load()
-    if loaded:
-        logger.info("FAISS index reloaded: %d vectors.", _recognizer.index.ntotal)
-    return loaded
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,19 +63,14 @@ async def recognize_image(
     - Detected faces are matched against the enrolled FAISS index.
     - Known faces → attendance marked automatically.
     - Unknown faces → logged to DB and image saved to storage/unknown_faces/.
+    
+    Raises
+    ------
+    HTTPException
+        400: Invalid/empty file or too large
+        503: Recognition index not ready (call POST /enroll first)
     """
-    global _index_ready
-
-    # ── Always reload from disk so newly-enrolled data is reflected ────────
-    # This is cheap (small index) and eliminates the stale-singleton bug.
-    _index_ready = _reload_recognizer()
-    if not _index_ready:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Recognition index not ready. Please call POST /enroll first.",
-        )
-
-    # ── Decode uploaded image ─────────────────────────────────────────────
+    # ── Validate file size before reading ──────────────────────────────────
     contents = await file.read()
 
     if len(contents) == 0:
@@ -92,18 +79,38 @@ async def recognize_image(
             detail="Uploaded file is empty.",
         )
 
-    # Primary decode path: OpenCV (fast, handles most JPEG/PNG/BMP)
+    if len(contents) > MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds {MAX_UPLOAD_SIZE_BYTES / (1024*1024):.0f}MB limit.",
+        )
+
+    # ── Reload recognizer from disk (picks up newly enrolled faces) ───────
+    # This is a deliberate trade-off: reload cost vs. freshness guarantee.
+    # For high-throughput scenarios, consider caching with TTL.
+    loaded = _recognizer.load()
+    if not loaded or _recognizer.index is None:
+        logger.error("Failed to load FAISS index from disk.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Recognition index not ready. Please call POST /enroll first.",
+        )
+
+    # ── Decode uploaded image (with fallback) ─────────────────────────────
     np_arr = np.frombuffer(contents, np.uint8)
     image  = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    # Fallback decode path: Pillow (handles WEBP, progressive JPEG, HEIC, etc.)
+    # Fallback: use Pillow for formats cv2 can't handle (WEBP, progressive JPEG, HEIC)
     if image is None:
         try:
             pil_img = PILImage.open(io.BytesIO(contents)).convert("RGB")
             image   = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-            logger.info("cv2.imdecode failed; decoded via Pillow fallback (format: %s).", pil_img.format)
+            logger.debug(
+                "cv2.imdecode fallback used (format: %s).",
+                getattr(pil_img, "format", "unknown"),
+            )
         except Exception as pil_exc:
-            logger.warning("Both cv2 and Pillow failed to decode image: %s", pil_exc)
+            logger.warning("Image decode failed (cv2 and Pillow): %s", pil_exc)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
@@ -113,7 +120,14 @@ async def recognize_image(
             )
 
     # ── Detect faces ──────────────────────────────────────────────────────
-    faces, boxes = _detector.detect(image)
+    try:
+        faces, boxes = _detector.detect(image)
+    except Exception as det_exc:
+        logger.error("Face detection failed: %s", det_exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Face detection failed. Please try again.",
+        )
 
     if faces is None or boxes is None:
         return RecognizeResponse(
@@ -124,8 +138,15 @@ async def recognize_image(
         )
 
     # ── Generate embeddings & recognise ───────────────────────────────────
-    embeddings    = _embedder.get_embedding(faces)          # (N, 512)
-    match_results = _recognizer.recognize_batch(embeddings) # [(name, conf), ...]
+    try:
+        embeddings    = _embedder.get_embedding(faces)          # (N, 512)
+        match_results = _recognizer.recognize_batch(embeddings) # [(name, conf), ...]
+    except Exception as rec_exc:
+        logger.error("Recognition/embedding failed: %s", rec_exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Face recognition failed. Please try again.",
+        )
 
     attendance_mgr = AttendanceManager(db)
     face_results:  List[FaceResult] = []
@@ -134,20 +155,41 @@ async def recognize_image(
         bbox = boxes[i].tolist() if i < len(boxes) else None
         is_unknown = name == UNKNOWN_LABEL
 
-        if is_unknown:
-            # Save unknown face crop for security logging
-            if bbox:
-                x1, y1, x2, y2 = bbox
-                crop = image[y1:y2, x1:x2]
-                attendance_mgr.log_unknown_face(face_crop=crop if crop.size > 0 else None)
+        try:
+            if is_unknown:
+                # Save unknown face crop for security logging
+                if bbox:
+                    x1, y1, x2, y2 = bbox
+                    crop = image[max(0, y1):y2, max(0, x1):x2]
+                    if crop.size > 0:
+                        attendance_mgr.log_unknown_face(face_crop=crop)
+                    else:
+                        attendance_mgr.log_unknown_face()
+                else:
+                    attendance_mgr.log_unknown_face()
             else:
-                attendance_mgr.log_unknown_face()
-        else:
-            # Mark attendance (deduplication handled inside)
-            attendance_mgr.mark_attendance(name, confidence)
+                # Mark attendance (deduplication handled inside)
+                attendance_mgr.mark_attendance(name, confidence)
+                logger.debug("Attendance marked for %s (confidence: %.4f)", name, confidence)
+        except Exception as att_exc:
+            logger.error("Attendance marking failed for %s: %s", name, att_exc)
+            # Continue processing other faces even if one fails
 
         face_results.append(
             FaceResult(
+                name=name,
+                confidence=round(confidence, 4),
+                is_unknown=is_unknown,
+                bbox=bbox,
+            )
+        )
+
+    return RecognizeResponse(
+        success=True,
+        faces_detected=len(face_results),
+        results=face_results,
+        message=f"Processed {len(face_results)} face(s) successfully.",
+    )
                 name=name,
                 confidence=round(confidence, 4),
                 is_unknown=is_unknown,

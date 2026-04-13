@@ -149,6 +149,46 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# ───────────────────────────────────────────────────────────────────
+# Project-specific files
+# ───────────────────────────────────────────────────────────────────
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Storage directories (keep structure but ignore content)
+/storage/logs/*
+/storage/embeddings/*
+/storage/unknown_faces/*
+!.gitkeep
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Frontend node modules (if applicable)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Local environment overrides
+.env.local
+.env.*.local
+
+# Test and coverage
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+
 # PyCharm
 .idea/
 

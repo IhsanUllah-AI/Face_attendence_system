@@ -21,10 +21,15 @@ faiss-cpu>=1.7.4              # CPU-only FAISS
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9      # Required for UploadFile in FastAPI
+slowapi>=0.1.9               # Rate limiting for FastAPI
 
 # ── Database ──────────────────────────────────────────────────────────
 sqlalchemy>=2.0.0
 
+# ── Configuration ─────────────────────────────────────────────────────
+python-dotenv>=1.0.0         # Load environment variables from .env file
+
 # ── Utilities ─────────────────────────────────────────────────────────
 numpy>=2.0.0
 pydantic>=2.0.0
+pydantic-settings>=2.0.0     # Enhanced settings management
